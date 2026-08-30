@@ -888,41 +888,63 @@ namespace {
     // SHOWN view gets a world-locked floating quad in front of the player,
     // keyed "prisma_vr_<viewId>_<n>". It runs on SteamVR native too — where
     // its laser INPUT cannot work (needs OC aim-pose data) — so the quads are
-    // uninteractable clutter duplicating what the wrist panel shows (the
-    // "floating PrismaUI at the opening screen"). Suppress them with the
-    // PUBLIC OpenVR API only: probe the predictable key space and HideOverlay.
+    // uninteractable clutter duplicating what the wrist panel shows. Suppress
+    // them with the PUBLIC OpenVR API only: find the quad by key, HideOverlay.
     //
     // Their SyncOverlays DESTROYS a quad when its view hides and RECREATES it
-    // (with a new key counter) when it is shown again, but never re-Shows an
-    // existing overlay — so a Hide sticks until recreation, and we must
-    // re-acquire after one: each discovery tick a found key is re-verified
-    // (miss => the quad was recreated somewhere new => resume probing).
-    struct QuadState { bool found = false; int nextProbe = 0; char key[64] = {}; };
+    // (with a fresh key counter) when the view is shown again, but never
+    // re-Shows an existing overlay — so a Hide sticks until a recreation.
+    // Recreations happen on OUR OWN panel-open flow (binding force-Shows a
+    // view, sister mods Show sub-views), so this runs EVERY pump tick
+    // (~100 ms): a newborn quad is caught within a tick or two instead of
+    // floating for seconds. Two things keep the per-tick cost tiny:
+    //   * only SHOWN views are hunted (quads exist only for those; IsHidden
+    //     is one cheap in-process API call per view), and
+    //   * their key counter is a global that ONLY INCREMENTS, so a fresh
+    //     hunt starts at the highest counter seen so far (gQuadCounterFloor)
+    //     — a recreated quad is found in the first probe burst.
+    struct QuadState { bool found = false; int huntOffset = 0; char key[64] = {}; };
     std::unordered_map<uint64_t, QuadState> gQuadStates;  // pump thread only
-    bool gBeamHidden[2] = { false, false };
+    std::vector<ViewEntry> gQuadViewCache;   // last discovery snapshot (pump thread)
+    int      gQuadCounterFloor = 0;
+    bool     gBeamHidden[2]    = { false, false };
+    uint64_t gQuadTick         = 0;
 
-    void HideNativePrismaQuads(const std::vector<ViewEntry>& views)
+    void HideNativePrismaQuads()
     {
         if (!gStockBuild || !gStockBuild->hasNativeVROverlays) return;
+        if (gQuadViewCache.empty()) return;
         auto* ov = vr::VROverlay();
         if (!ov) return;
-        constexpr int kMaxCounter    = 128;  // key counters grow per recreation
-        constexpr int kProbesPerTick = 16;   // bounded IPC per view per tick
+        ++gQuadTick;
+        constexpr int kCounterSpace  = 512;  // sweep wraps the whole space over time
+        constexpr int kProbesPerTick = 16;
+        const bool verifyTick = (gQuadTick % 5) == 0;  // found-key re-check ~2/s
 
-        for (const auto& v : views) {
+        for (const auto& v : gQuadViewCache) {
             auto& st = gQuadStates[v.id];
+
+            // Hidden view => their sync destroyed (or never made) its quad.
+            if (gPrismaUI && gPrismaUI->IsHidden(v.id)) {
+                st.found = false;
+                st.huntOffset = 0;
+                continue;
+            }
+
             if (st.found) {
+                if (!verifyTick) continue;
                 vr::VROverlayHandle_t h = vr::k_ulOverlayHandleInvalid;
                 if (ov->FindOverlay(st.key, &h) == vr::VROverlayError_None &&
                     h != vr::k_ulOverlayHandleInvalid) {
-                    ov->HideOverlay(h);      // idempotent re-assert
+                    ov->HideOverlay(h);       // idempotent re-assert
                     continue;
                 }
-                st.found = false;            // destroyed — was it recreated?
-                st.nextProbe = 0;
+                st.found = false;             // destroyed; recreation lands at >= floor
+                st.huntOffset = 0;
             }
+
             for (int i = 0; i < kProbesPerTick; ++i) {
-                const int n = (st.nextProbe + i) % kMaxCounter;
+                const int n = (gQuadCounterFloor + st.huntOffset + i) % kCounterSpace;
                 char key[64];
                 std::snprintf(key, sizeof(key), "prisma_vr_%llu_%d",
                               static_cast<unsigned long long>(v.id), n);
@@ -932,16 +954,17 @@ namespace {
                     ov->HideOverlay(h);
                     std::memcpy(st.key, key, sizeof(st.key));
                     st.found = true;
+                    st.huntOffset = 0;
+                    if (n + 1 > gQuadCounterFloor) gQuadCounterFloor = n + 1;
                     SKSE::log::info("Hid PrismaUI's own floating VR quad '{}' — the wrist "
                                     "panel is the presentation on SteamVR native.", key);
                     break;
                 }
             }
-            if (!st.found) st.nextProbe = (st.nextProbe + kProbesPerTick) % kMaxCounter;
+            if (!st.found) st.huntOffset = (st.huntOffset + kProbesPerTick) % kCounterSpace;
         }
 
-        // Their laser-beam overlays (fixed keys, created once if their input
-        // path arms). Uninteractable on native — hide if they ever appear.
+        // Their laser-beam overlays (fixed keys). Uninteractable on native.
         static const char* kBeamKeys[2] = { "prisma_laser_beam_L", "prisma_laser_beam_R" };
         for (int i = 0; i < 2; ++i) {
             if (gBeamHidden[i]) continue;
@@ -3893,11 +3916,15 @@ namespace {
                         loggedLiveViewCount = static_cast<int>(views.size());
                     }
                     BindSlotsToViews(views);
-                    // 1.5+: keep PrismaUI's own floating VR quads hidden — the
-                    // wrist panel is the sole presentation on SteamVR native.
-                    HideNativePrismaQuads(views);
+                    gQuadViewCache = views;   // feeds the per-tick quad suppressor
                 }
             }
+
+            // --- 1a½) 1.5+: keep PrismaUI's own floating VR quads hidden.
+            // EVERY tick, not just on discovery — their sync recreates a quad
+            // the moment a view is (re)shown, which is exactly what our own
+            // panel-open flow does, and a 2s sweep let it float visibly.
+            HideNativePrismaQuads();
 
             // --- 1b) Refresh active-view-per-slot (Option B follow path) ---
             // Walk each slot's family; for any sibling that's currently
