@@ -658,6 +658,19 @@ namespace {
         // sha256 5C6DA41F…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 16
         { 0x01040010, "1.4.1.0", 0x91B40, 0x93880, 0x1AA108, 0x1AA128, 0x038,
           0x926C0, 0x92F39, 0xBFA50, 0x5D56F },
+        // 1.5.0.0 RC — adds upstream's own OCU VR path + gamepad support.
+        // sha256 5D76BF9E…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 24.
+        // Seams re-verified against the 1.5 source (upstream dev branch):
+        // UpdateSingleTextureFromBuffer still calls CopyPixelsToTexture under
+        // bufferMutex after the newFrameReady exchange (same 5-arg signature),
+        // DrawSingleTexture still takes shared_ptr by value, viewsMutex is
+        // still a bare SRWLOCK (imports Acquire* but not InitializeSRWLock),
+        // PrismaView still has id at +0 / originalUrl at +0x38 / sizeof 760.
+        // Exhaustive E8 scans: exactly ONE caller for each callee below; the
+        // screen-size call site is followed by `mov [rip+…], rax` targeting
+        // Core::screenSize (0x1CD570) — the one write that sizes new views.
+        { 0x01050000, "1.5.0 RC", 0xACD70, 0xAEAB0, 0x1CEA38, 0x1CEA58, 0x038,
+          0xAD8F0, 0xAE169, 0xDA600, 0x5D9DF },
     };
 
     // ---- view resolution ------------------------------------------------
@@ -2083,7 +2096,17 @@ namespace {
 
         // gGetBitmapIfNew + gResizeView + gDeliverChar/VKey are OPTIONAL — older PrismaUI builds don't have them.
         if (!gGetBitmap || !gSetVREnab || !gGetCount || !gGetViewInfo || !gFireMouse) {
-            SKSE::log::error("Patched PrismaUI exports missing — wrong PrismaUI.dll is loaded.");
+            SKSE::log::error("Patched PrismaUI exports missing — not a fork build; trying addon mode.");
+            // Null everything resolved so far. Stock 1.5+ exports a PARTIAL
+            // PrismaVR_* set (the legacy OCU-gated DeliverChar/DeliverVKey) —
+            // leaving those set after a failed resolve would let future code
+            // gated on them call into a path that no-ops (or worse) outside
+            // OCU. A failed resolve must leave NO fork pointers behind.
+            gGetBitmap = nullptr;  gGetBitmapIfNew = nullptr;  gSetVREnab = nullptr;
+            gGetCount = nullptr;   gGetViewInfo = nullptr;     gFireMouse = nullptr;
+            gResizeView = nullptr; gDeliverChar = nullptr;     gDeliverVKey = nullptr;
+            gDeliverCharToView = nullptr;  gDeliverVKeyToView = nullptr;
+            gFireScrollToView = nullptr;
             return false;
         }
         SKSE::log::info("Patched PrismaUI exports resolved (if-new={}, resize={}, kbd-gated={}, kbd-toview={}, scroll={})",

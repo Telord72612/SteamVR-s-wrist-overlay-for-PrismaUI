@@ -18,7 +18,7 @@ Works on the **stock, unmodified PrismaUI from Nexus**. This mod ships only its 
 ## Requirements
 
 - Skyrim VR with SKSE VR
-- **PrismaUI 1.4.1** (stock, from Nexus)
+- **PrismaUI 1.4.1 or 1.5.0 RC** (stock, from Nexus)
 - SkyUI VR + **MCM Helper (the VR build)** — load MCM Helper *after* SkyUI VR
 - **SkyrimVR ESL Support** (`skyrimvresl`) — the plugin is ESL-flagged
 - A **SteamVR-native** runtime. Under OpenComposite this mod stays dormant on purpose — PrismaUI 1.5+ has its own OCU path there.
@@ -53,6 +53,7 @@ The plugin identifies the exact PrismaUI build at startup from a compiled-in off
 | PrismaUI | Status |
 |---|---|
 | 1.4.1 | ✅ Supported |
+| 1.5.0 RC | ✅ Supported (seams re-verified against the 1.5 source; exactly one call site per hook, same lock/signature contracts) |
 | anything else | Fails closed — icons appear, panels show a test pattern, PrismaUI untouched |
 
 Supporting a new PrismaUI release takes one run of [`tools/gen_offsets.py`](tools/gen_offsets.py) against that release's `PrismaUI.dll` + `PrismaUI.pdb` (Nexus ships the PDB alongside), pasting the emitted row into `kPrismaBuilds` in `src/main.cpp`, and rebuilding. Offsets are generated offline — nothing is parsed at runtime.
