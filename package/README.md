@@ -23,8 +23,8 @@ forbids redistributing a modified PrismaUI).
 
 ## Requirements
 
-- **PrismaUI 1.4.1** (stock, from Nexus) — the supported build. Other versions
-  are refused safely (see "Version safety" below).
+- **PrismaUI 1.4.1 or 1.5.0 RC** (stock, from Nexus) — the supported builds.
+  Other versions are refused safely (see "Version safety" below).
 - SkyUI VR + **MCM Helper (the VR build)** — the SE build will not load under SKSE VR.
   Load MCM Helper **after** SkyUI VR — both ship a loose `SKI_ConfigMenu.pex`
   and MCM Helper's copy must win.
@@ -45,8 +45,7 @@ through PrismaUI's **public** API. PrismaUI itself is never modified on disk.
 ## Version safety (why it's safe to leave enabled)
 
 The DLL identifies the exact PrismaUI build before touching anything. An
-unknown version — including **PrismaUI 1.5.0 RC** until an offset row is
-generated for it — installs **nothing**: PrismaUI is left byte-identical, every
+unknown version installs **nothing**: PrismaUI is left byte-identical, every
 other PrismaUI mod keeps working, the wrist icons still appear, and the panel
 shows a test pattern instead of content. Each new PrismaUI release needs one
 regenerated offset row (from its DLL+PDB pair) before the panel lights up on it.
