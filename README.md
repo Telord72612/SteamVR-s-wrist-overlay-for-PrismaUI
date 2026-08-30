@@ -79,7 +79,7 @@ Output: `build/windows/x64/release/PrismaUISteamVR.dll`. Drop it into the mod's 
 
 ## Credits
 
-- **[PrismaUI](https://github.com/PrismaUI-SKSE/framework)** by the PrismaUI-SKSE team — the framework this rides on. This project is not affiliated with them; it hooks PrismaUI 1.4.1's internals read-only-on-disk and disables itself on any other version. (A PR to add a native external-consumer API to PrismaUI itself is open upstream as [PrismaUI-SKSE/framework#37](https://github.com/PrismaUI-SKSE/framework/pull/37) — if it lands, the hook layer retires.)
+- **[PrismaUI](https://github.com/PrismaUI-SKSE/framework)** by the PrismaUI-SKSE team — the framework this rides on. This project is not affiliated with them; it hooks PrismaUI 1.4.1's internals read-only-on-disk and disables itself on any other version. 
 - CommonLibVR, SKSE, MCM Helper, SkyUI — the shoulders everything VR stands on.
 
 ## License
