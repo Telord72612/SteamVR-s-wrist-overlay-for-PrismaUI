@@ -27,6 +27,7 @@
 #include <fstream>   // direct INI parse (bypasses PrivateProfileRedirector cache)
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <d3d11.h>
@@ -651,13 +652,14 @@ namespace {
         uintptr_t   rvaDrawSingleCall;  // the ONE E8 call site invoking it
         uintptr_t   rvaScreenSize;      // the GetScreenSize thunk PrismaUI calls
         uintptr_t   rvaScreenSizeCall;  // its call site, feeding Core::screenSize
+        bool        hasNativeVROverlays; // 1.5+: PrismaUI's own floating VR quads
     };
 
     constexpr PrismaBuild kPrismaBuilds[] = {
         // 1.4.1.0 — Nexus "Prisma UI - Next-Gen Web UI Framework"
         // sha256 5C6DA41F…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 16
         { 0x01040010, "1.4.1.0", 0x91B40, 0x93880, 0x1AA108, 0x1AA128, 0x038,
-          0x926C0, 0x92F39, 0xBFA50, 0x5D56F },
+          0x926C0, 0x92F39, 0xBFA50, 0x5D56F, false },
         // 1.5.0.0 RC — adds upstream's own OCU VR path + gamepad support.
         // sha256 5D76BF9E…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 24.
         // Seams re-verified against the 1.5 source (upstream dev branch):
@@ -670,7 +672,7 @@ namespace {
         // screen-size call site is followed by `mov [rip+…], rax` targeting
         // Core::screenSize (0x1CD570) — the one write that sizes new views.
         { 0x01050000, "1.5.0 RC", 0xACD70, 0xAEAB0, 0x1CEA38, 0x1CEA58, 0x038,
-          0xAD8F0, 0xAE169, 0xDA600, 0x5D9DF },
+          0xAD8F0, 0xAE169, 0xDA600, 0x5D9DF, true },
     };
 
     // ---- view resolution ------------------------------------------------
@@ -879,6 +881,78 @@ namespace {
             if (ids[i] && u[0]) out.push_back({ ids[i], std::string(u) });
         }
         return out;
+    }
+
+    // ---- PrismaUI 1.5+ native-VR quad suppression ------------------------
+    // 1.5 grew its own VR display path (designed for OpenComposite): every
+    // SHOWN view gets a world-locked floating quad in front of the player,
+    // keyed "prisma_vr_<viewId>_<n>". It runs on SteamVR native too — where
+    // its laser INPUT cannot work (needs OC aim-pose data) — so the quads are
+    // uninteractable clutter duplicating what the wrist panel shows (the
+    // "floating PrismaUI at the opening screen"). Suppress them with the
+    // PUBLIC OpenVR API only: probe the predictable key space and HideOverlay.
+    //
+    // Their SyncOverlays DESTROYS a quad when its view hides and RECREATES it
+    // (with a new key counter) when it is shown again, but never re-Shows an
+    // existing overlay — so a Hide sticks until recreation, and we must
+    // re-acquire after one: each discovery tick a found key is re-verified
+    // (miss => the quad was recreated somewhere new => resume probing).
+    struct QuadState { bool found = false; int nextProbe = 0; char key[64] = {}; };
+    std::unordered_map<uint64_t, QuadState> gQuadStates;  // pump thread only
+    bool gBeamHidden[2] = { false, false };
+
+    void HideNativePrismaQuads(const std::vector<ViewEntry>& views)
+    {
+        if (!gStockBuild || !gStockBuild->hasNativeVROverlays) return;
+        auto* ov = vr::VROverlay();
+        if (!ov) return;
+        constexpr int kMaxCounter    = 128;  // key counters grow per recreation
+        constexpr int kProbesPerTick = 16;   // bounded IPC per view per tick
+
+        for (const auto& v : views) {
+            auto& st = gQuadStates[v.id];
+            if (st.found) {
+                vr::VROverlayHandle_t h = vr::k_ulOverlayHandleInvalid;
+                if (ov->FindOverlay(st.key, &h) == vr::VROverlayError_None &&
+                    h != vr::k_ulOverlayHandleInvalid) {
+                    ov->HideOverlay(h);      // idempotent re-assert
+                    continue;
+                }
+                st.found = false;            // destroyed — was it recreated?
+                st.nextProbe = 0;
+            }
+            for (int i = 0; i < kProbesPerTick; ++i) {
+                const int n = (st.nextProbe + i) % kMaxCounter;
+                char key[64];
+                std::snprintf(key, sizeof(key), "prisma_vr_%llu_%d",
+                              static_cast<unsigned long long>(v.id), n);
+                vr::VROverlayHandle_t h = vr::k_ulOverlayHandleInvalid;
+                if (ov->FindOverlay(key, &h) == vr::VROverlayError_None &&
+                    h != vr::k_ulOverlayHandleInvalid) {
+                    ov->HideOverlay(h);
+                    std::memcpy(st.key, key, sizeof(st.key));
+                    st.found = true;
+                    SKSE::log::info("Hid PrismaUI's own floating VR quad '{}' — the wrist "
+                                    "panel is the presentation on SteamVR native.", key);
+                    break;
+                }
+            }
+            if (!st.found) st.nextProbe = (st.nextProbe + kProbesPerTick) % kMaxCounter;
+        }
+
+        // Their laser-beam overlays (fixed keys, created once if their input
+        // path arms). Uninteractable on native — hide if they ever appear.
+        static const char* kBeamKeys[2] = { "prisma_laser_beam_L", "prisma_laser_beam_R" };
+        for (int i = 0; i < 2; ++i) {
+            if (gBeamHidden[i]) continue;
+            vr::VROverlayHandle_t h = vr::k_ulOverlayHandleInvalid;
+            if (ov->FindOverlay(kBeamKeys[i], &h) == vr::VROverlayError_None &&
+                h != vr::k_ulOverlayHandleInvalid) {
+                ov->HideOverlay(h);
+                gBeamHidden[i] = true;
+                SKSE::log::info("Hid PrismaUI's native laser beam '{}'", kBeamKeys[i]);
+            }
+        }
     }
 
     // Bring up addon mode against a stock PrismaUI: identify the build, verify
@@ -3819,6 +3893,9 @@ namespace {
                         loggedLiveViewCount = static_cast<int>(views.size());
                     }
                     BindSlotsToViews(views);
+                    // 1.5+: keep PrismaUI's own floating VR quads hidden — the
+                    // wrist panel is the sole presentation on SteamVR native.
+                    HideNativePrismaQuads(views);
                 }
             }
 
