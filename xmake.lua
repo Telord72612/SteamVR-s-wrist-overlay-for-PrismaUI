@@ -3,6 +3,11 @@
 -- wrist. Runs against a stock, unmodified PrismaUI ("addon mode": call-site
 -- hooks for pixels + view size, view-map walk for discovery, public Invoke
 -- for input), or against a patched fork exposing the PrismaVR_* ABI.
+--
+-- Also hosts the SKSE Menu Framework as a second native panel source (V2.0):
+-- five validated call-site hooks inside SMF's own frame function. No ImGui VR
+-- Helper dependency, and no vendored SDK -- coexistence with the helper is
+-- handled by the hooks themselves (passthrough whenever our session is idle).
 
 set_xmakever("3.0.0")
 
@@ -13,7 +18,7 @@ local commonlibvr = os.getenv("COMMONLIB_VR_DIR") or "D:/Games/My Skyrim/Tools/C
 includes(commonlibvr)
 
 set_project("PrismaUISteamVR")
-set_version("1.1.2")
+set_version("2.0.0")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")

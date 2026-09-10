@@ -20,21 +20,21 @@
           "type": "menu",
           "text": "Icon 1",
           "help": "Overlay this wrist icon opens. 'Off' hides just this icon. 'Auto' = SkyrimNet dashboard. Otherwise pick an overlay by name - the list rebuilds itself each launch as overlays are found, and your choice stays bound to that overlay by name. Re-launch after installing a new overlay mod for it to appear here.",
-          "valueOptions": { "sourceType": "ModSettingString", "options": [ "Auto", "Off", "IntelEngine/dashboard", "SeverActions", "SeverActionsArrestPrompt", "SeverActionsBrawlPrompt", "SeverActionsDiary", "SeverActionsLetter", "SeverActionsPrompt", "SeverActionsRetainerPrompt", "SeverActionsTravelPrompt", "SkyrimNet/chat", "SkyrimNet/dashboard" ], "defaultValue": "Auto" }
+          "valueOptions": { "sourceType": "ModSettingString", "options": [ "Auto", "Off", "SKSE Menu Framework", "IntelEngine/dashboard", "MHiYH", "SeverActions", "SeverActionsArrestPrompt", "SeverActionsBrawlPrompt", "SeverActionsDiary", "SeverActionsLetter", "SeverActionsPrompt", "SeverActionsRetainerPrompt", "SeverActionsTravelPrompt", "SkyrimNet/chat", "SkyrimNet/dashboard" ], "defaultValue": "Auto" }
         },
         {
           "id": "sIconSA:Icons",
           "type": "menu",
           "text": "Icon 2",
           "help": "Overlay this wrist icon opens. 'Off' hides just this icon. 'Auto' = SeverActions. Otherwise pick an overlay by name - the list rebuilds itself each launch as overlays are found, and your choice stays bound to that overlay by name. Re-launch after installing a new overlay mod for it to appear here.",
-          "valueOptions": { "sourceType": "ModSettingString", "options": [ "Auto", "Off", "IntelEngine/dashboard", "SeverActions", "SeverActionsArrestPrompt", "SeverActionsBrawlPrompt", "SeverActionsDiary", "SeverActionsLetter", "SeverActionsPrompt", "SeverActionsRetainerPrompt", "SeverActionsTravelPrompt", "SkyrimNet/chat", "SkyrimNet/dashboard" ], "defaultValue": "Auto" }
+          "valueOptions": { "sourceType": "ModSettingString", "options": [ "Auto", "Off", "SKSE Menu Framework", "IntelEngine/dashboard", "MHiYH", "SeverActions", "SeverActionsArrestPrompt", "SeverActionsBrawlPrompt", "SeverActionsDiary", "SeverActionsLetter", "SeverActionsPrompt", "SeverActionsRetainerPrompt", "SeverActionsTravelPrompt", "SkyrimNet/chat", "SkyrimNet/dashboard" ], "defaultValue": "Auto" }
         },
         {
           "id": "sIconIE:Icons",
           "type": "menu",
           "text": "Icon 3",
           "help": "Overlay this wrist icon opens. 'Off' hides just this icon. 'Auto' = IntelEngine. Otherwise pick an overlay by name - the list rebuilds itself each launch as overlays are found, and your choice stays bound to that overlay by name. Re-launch after installing a new overlay mod for it to appear here.",
-          "valueOptions": { "sourceType": "ModSettingString", "options": [ "Auto", "Off", "IntelEngine/dashboard", "SeverActions", "SeverActionsArrestPrompt", "SeverActionsBrawlPrompt", "SeverActionsDiary", "SeverActionsLetter", "SeverActionsPrompt", "SeverActionsRetainerPrompt", "SeverActionsTravelPrompt", "SkyrimNet/chat", "SkyrimNet/dashboard" ], "defaultValue": "Auto" }
+          "valueOptions": { "sourceType": "ModSettingString", "options": [ "Auto", "Off", "SKSE Menu Framework", "IntelEngine/dashboard", "MHiYH", "SeverActions", "SeverActionsArrestPrompt", "SeverActionsBrawlPrompt", "SeverActionsDiary", "SeverActionsLetter", "SeverActionsPrompt", "SeverActionsRetainerPrompt", "SeverActionsTravelPrompt", "SkyrimNet/chat", "SkyrimNet/dashboard" ], "defaultValue": "Auto" }
         }
       ]
     }

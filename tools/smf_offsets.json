@@ -1,0 +1,216 @@
+{
+  "file": "SKSEMenuFramework.dll",
+  "size": 4166144,
+  "sha256": "B0FAB9D77BB522D1C3518FABF577128F020A2B85B1126B799BD98A4BA0EAEDD7",
+  "version": "3.13.0.0",
+  "version_raw": 51183616,
+  "imagebase": 6442450944,
+  "functions": {
+    "RenderDrawData": 6592,
+    "DX11_NewFrame": 11136,
+    "Win32_NewFrame": 16672,
+    "ImGui_NewFrame": 73168,
+    "ImGui_Render": 79216,
+    "ImGui_GetDrawData": 69280,
+    "SMF_Render": 1154144,
+    "InputHook_thunk": 1151952,
+    "ShouldTheGameBePaused": 1314496,
+    "Config_FreezeTime": 3963230,
+    "Client_BlitDrawData": 1149264,
+    "Client_RenderToPanel": 1148016,
+    "Client_RenderFrame": 1148720,
+    "Client_PumpInput": 1146400,
+    "Client_IsConnected": 1144800,
+    "Client_HasFocus": 1144832,
+    "Client_PumpKeyboard": 1144848,
+    "WM_IsAnyWindowOpen": 1314368,
+    "WM_Open": 1314768,
+    "WM_Close": 1314672,
+    "EnableImGuiInput": 1151776,
+    "DisableImGuiInput": 1151744,
+    "GameLock_SetState": 990800,
+    "UI_RenderWindows": 1190016
+  },
+  "callsites": [
+    {
+      "site": 11976,
+      "kind": "call",
+      "target": "RenderDrawData",
+      "in": "??1ImGui_ImplDX11_ViewportData@@QEAA@XZ"
+    },
+    {
+      "site": 1148529,
+      "kind": "call",
+      "target": "RenderDrawData",
+      "in": "?RenderToPanel@Client@ImGuiVRHelperPluginAPI@@QEAAXPEAUID3D11DeviceContext@@@Z"
+    },
+    {
+      "site": 1148747,
+      "kind": "jmp",
+      "target": "Client_RenderToPanel",
+      "in": "?RenderFrame@Client@ImGuiVRHelperPluginAPI@@QEAAXPEAUID3D11DeviceContext@@@Z"
+    },
+    {
+      "site": 1148764,
+      "kind": "jmp",
+      "target": "RenderDrawData",
+      "in": "?RenderFrame@Client@ImGuiVRHelperPluginAPI@@QEAAXPEAUID3D11DeviceContext@@@Z"
+    },
+    {
+      "site": 1148908,
+      "kind": "call",
+      "target": "Client_PumpInput",
+      "in": "?Update@Client@ImGuiVRHelperPluginAPI@@QEAA_NAEA_NM@Z"
+    },
+    {
+      "site": 1149553,
+      "kind": "call",
+      "target": "RenderDrawData",
+      "in": "?BlitDrawData@Client@ImGuiVRHelperPluginAPI@@AEAAXPEAUID3D11DeviceContext@@AEBUPanelHandle@2@PEAUImDrawData@@@Z"
+    },
+    {
+      "site": 1152065,
+      "kind": "call",
+      "target": "ShouldTheGameBePaused",
+      "in": "?thunk@ProcessInputQueueHook@Hooks@@SAXPEAV?$BSTEventSource@PEAVInputEvent@RE@@@RE@@PEBQEAVInputEvent@4@@Z"
+    },
+    {
+      "site": 1154237,
+      "kind": "call",
+      "target": "WM_IsAnyWindowOpen",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154332,
+      "kind": "call",
+      "target": "Client_PumpInput",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154337,
+      "kind": "call",
+      "target": "WM_IsAnyWindowOpen",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154362,
+      "kind": "call",
+      "target": "Client_PumpKeyboard",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154367,
+      "kind": "call",
+      "target": "ShouldTheGameBePaused",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154376,
+      "kind": "call",
+      "target": "EnableImGuiInput",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154383,
+      "kind": "call",
+      "target": "DisableImGuiInput",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154388,
+      "kind": "call",
+      "target": "DX11_NewFrame",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154393,
+      "kind": "call",
+      "target": "Win32_NewFrame",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154480,
+      "kind": "call",
+      "target": "ImGui_NewFrame",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154490,
+      "kind": "call",
+      "target": "WM_IsAnyWindowOpen",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154510,
+      "kind": "call",
+      "target": "ShouldTheGameBePaused",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154527,
+      "kind": "call",
+      "target": "GameLock_SetState",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154532,
+      "kind": "call",
+      "target": "UI_RenderWindows",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154544,
+      "kind": "call",
+      "target": "GameLock_SetState",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154553,
+      "kind": "call",
+      "target": "UI_RenderWindows",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154569,
+      "kind": "call",
+      "target": "GameLock_SetState",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154584,
+      "kind": "call",
+      "target": "ImGui_Render",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154608,
+      "kind": "call",
+      "target": "Client_RenderToPanel",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1154623,
+      "kind": "call",
+      "target": "RenderDrawData",
+      "in": "?Render@@YAXXZ"
+    },
+    {
+      "site": 1191552,
+      "kind": "jmp",
+      "target": "ShouldTheGameBePaused",
+      "in": "IsAnyBlockingWindowOpened"
+    },
+    {
+      "site": 1318480,
+      "kind": "jmp",
+      "target": "ImGui_NewFrame",
+      "in": "igNewFrame"
+    },
+    {
+      "site": 1318512,
+      "kind": "jmp",
+      "target": "ImGui_Render",
+      "in": "igRender"
+    }
+  ]
+}

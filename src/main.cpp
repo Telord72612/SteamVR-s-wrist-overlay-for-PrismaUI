@@ -19,6 +19,7 @@
 
 #include "pch.h"
 #include "PrismaUI_API.h"
+#include <cfloat>
 
 #include <algorithm>  // std::find — slot-family duplicate-membership check
 #include <atomic>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include <d3d11.h>
+#include <d3d11_4.h>   // ID3D11Multithread (immediate-context lock)
 
 namespace {
     // ---- Overlay configuration -------------------------------------------
@@ -472,6 +474,10 @@ namespace {
     bool                        gLoggedSyntheticPanel = false;
     bool                        gLoggedFirstCapture   = false;  // addon-mode first real frame
     bool                        gLoggedCapTooSmall    = false;  // addon-mode oversized-frame warning
+    bool                        gSlotIsSmf[Slot_Count] = { false, false, false };  // slot bound to the SKSE Menu Framework source
+    bool                        gSmfPanelBound         = false;  // SetOverlayTexture done for the current SMF texture
+    bool                        gSmfSubmitErrLogged    = false;  // dedupe the per-tick submit error
+    void*                       gSmfBoundTex           = nullptr;// last texture handed to SteamVR (identity only, not owned)
     bool                        gJumpSuppressed       = false;  // stick guard active (jump+sneak masked while the dot is on the panel)
     uint32_t                    gStickSuppressedFlags = 0;      // UEFlag bits WE masked (snapshot at suppress time)
     int                         gStickLingerTicks     = 0;      // keeps the guard alive briefly after the dot leaves
@@ -570,6 +576,10 @@ namespace {
     // different input or re-focus the same one).
     bool                  gKeyboardOpen           = false;
     bool                  gKbdAutoSuppressed      = false;
+    uint32_t              gKbdCharsThisSession    = 0;      // per-char events seen (incl. empty ones)
+    uint32_t              gKbdRealCharsThisSession = 0;     // events carrying an actual character
+    std::string           gKbdLastLiveText;                 // last seen live buffer (change detection)
+    std::string           gKbdHarvested;                    // string rebuilt from the 1-char buffer
     bool                  gFocusLastForActiveSlot = false;
     std::atomic<uint64_t> gFocusedTextInputView{ 0 };
 
@@ -1198,6 +1208,437 @@ namespace {
         return out;
     }
 
+    // ======================================================================
+    // SKSE MENU FRAMEWORK (SMF) AS A NATIVE PANEL SOURCE  (v1.4.0)
+    //
+    // No ImGui VR Helper involved. SMF's own frame function (?Render@@YAXXZ,
+    // driven from the game's render thread) is re-pointed at five E8 call
+    // sites (doc 08: call sites, never prologues; validate; fail closed):
+    //
+    //   siteNewFrame    ImGui::NewFrame     -> inject wrist pointer/wheel/chars
+    //                                          via SMF's exported cimgui event
+    //                                          API, clear ImGuiConfigFlags_NoMouse
+    //                                          (SMF sets it when "unpaused"), and
+    //                                          override io.DisplaySize to the
+    //                                          panel resolution. Runs AFTER the
+    //                                          Win32 backend queued the OS cursor
+    //                                          and after SMF wrote DisplaySize, so
+    //                                          ours wins on both.
+    //   siteFlatDraw    ImGui_ImplDX11_RenderDrawData  (helper NOT connected)
+    //   siteHelperDraw  Client::RenderToPanel          (helper connected)
+    //                   -> while OUR session is active, both redirect the draw
+    //                      into a game-device MISC_SHARED texture the wrist
+    //                      overlay reads live; otherwise pure passthrough, so
+    //                      F1 keeps behaving exactly as stock (coexistence).
+    //   siteFocusSyncA/B  the two WindowManager::IsAnyWindowOpen calls in the
+    //                      helper focus-sync block -> return false during our
+    //                      session so the helper neither steals the window
+    //                      (RequestFocus -> duplicate panel) nor closes it
+    //                      (focus mismatch -> WindowManager::Close every frame).
+    //                      The third IsAnyWindowOpen call (the render gate) is
+    //                      deliberately NOT hooked - it must see "open".
+    //
+    // Pause: never hooked at all. WindowManager::ShouldTheGameBePaused() is
+    // "any window open with BlockUserInput set", and both flags are PUBLIC
+    // atomics on the exported WindowInterface. Our session opens the main
+    // window with BlockUserInput=false, so all four pause consumers (game
+    // lock, input swallow, ImGui input enable, blur) see "not paused" and the
+    // game keeps running - the wrist menu stays dynamic by construction.
+    // F1 sessions leave the flag alone and keep SMF's ini behaviour.
+    //
+    // Threading: render-thread code (the detours) touches only this module's
+    // atomics, SMF exports, and the game's immediate context FROM the thread
+    // that owns it. The pump touches only device-object creation (free-
+    // threaded per D3D11 spec) and our OWN device. The v1.3.x helper-mirror
+    // deadlock (device critical section held across a compositor round-trip)
+    // is structurally impossible here: nothing crosses threads.
+    // ======================================================================
+    // NOTE (V2.0.0): the vendored ImGuiVRHelper* client SDK was REMOVED -- the
+    // native path below needs none of it (our own typedefs describe the two
+    // hooked helper functions), so carrying it only added an LGPL attribution
+    // obligation and a nlohmann_json dependency. Helper COEXISTENCE is handled
+    // entirely by the siteHelperDraw / siteFocusSync hooks, not by its API.
+    namespace smf {
+        constexpr const char* kSourceName = "SKSE Menu Framework";
+
+        // ---- known builds (generated offline by gen_smf_offsets.py) ------
+        struct SmfBuild {
+            uint32_t    version;             // SKSEPlugin_Version pluginVersion
+            const char* label;
+            uintptr_t   rvaRenderDrawData;   // ImGui_ImplDX11_RenderDrawData (callee)
+            uintptr_t   rvaNewFrame;         // ImGui::NewFrame (callee)
+            uintptr_t   rvaGetDrawData;      // ImGui::GetDrawData
+            uintptr_t   rvaIsAnyWindowOpen;  // WindowManager::IsAnyWindowOpen
+            uintptr_t   rvaRenderToPanel;    // helper Client::RenderToPanel (callee)
+            uintptr_t   siteNewFrame;        // E8 sites inside ?Render@@YAXXZ:
+            uintptr_t   siteFlatDraw;
+            uintptr_t   siteHelperDraw;
+            uintptr_t   siteFocusSyncA;      // IsAnyWindowOpen @ Render+0x5D
+            uintptr_t   siteFocusSyncB;      // IsAnyWindowOpen @ Render+0xC1
+            uint32_t    offMouseDrawCursor;  // ImGuiIO::MouseDrawCursor (PDB LF_MEMBER)
+        };
+        constexpr SmfBuild kSmfBuilds[] = {
+            // 3.13.0 - sha256 B0FAB9D77BB522D1..., ImGui 1.90.8, 52 MB PDB shipped
+            { 0x030D0000, "3.13.0",
+              0x00019C0, 0x0011DD0, 0x0010EA0, 0x0140E40, 0x0118470,
+              0x0119DB0, 0x0119E3F, 0x0119E30, 0x0119CBD, 0x0119D21, 0x58 },
+        };
+
+        // ---- SMF's exported surface (SDK-sanctioned; layouts per its own
+        // header: ImGuiIO ConfigFlags at +0, DisplaySize at +8; WindowInterface
+        // is two std::atomic<bool>, IsOpen then BlockUserInput). Gated on the
+        // exact build above, so the 1.90.8 layout assumption is version-safe.
+        struct NativeIO { int ConfigFlags; int BackendFlags; float DisplaySizeX; float DisplaySizeY; };
+        struct WindowIface { std::atomic<bool> IsOpen; std::atomic<bool> BlockUserInput; };
+        using GetIO_t         = NativeIO* (*)();
+        using GetMainWin_t    = WindowIface* (*)();
+        using AddMousePos_t   = void (*)(NativeIO*, float, float);
+        using AddMouseBtn_t   = void (*)(NativeIO*, int, bool);
+        using AddWheel_t      = void (*)(NativeIO*, float, float);
+        using AddChar_t       = void (*)(NativeIO*, unsigned int);
+        using RenderDD_t      = void (*)(void*);
+        using GetDrawData_t   = void* (*)();
+        using NewFrame_t      = void (*)();
+        using IsAnyOpen_t     = bool (*)();
+        using RenderToPanel_t = void (*)(void*, ID3D11DeviceContext*);
+
+        uintptr_t        gBase   = 0;
+        const SmfBuild*  gBuild  = nullptr;
+        bool             gTried  = false;
+        bool             gHooked = false;
+        GetIO_t          gGetIO        = nullptr;
+        GetMainWin_t     gGetMainWin   = nullptr;
+        AddMousePos_t    gAddMousePos  = nullptr;
+        AddMouseBtn_t    gAddMouseBtn  = nullptr;
+        AddWheel_t       gAddWheel     = nullptr;
+        AddChar_t        gAddChar      = nullptr;
+        RenderDD_t       gRenderDrawData  = nullptr;   // callee, called directly by our redirect
+        GetDrawData_t    gGetDrawData     = nullptr;
+        IsAnyOpen_t      gIsAnyWindowOpen = nullptr;   // real function (sites are hooked, callee is not)
+        NewFrame_t       gOrigNewFrame      = nullptr; // originals returned by write_call
+        RenderDD_t       gOrigFlatDraw      = nullptr;
+        RenderToPanel_t  gOrigRenderToPanel = nullptr;
+
+        // ---- pump -> render-thread mailbox (atomics only; no locks) ------
+        std::atomic<bool>     gSession{ false };
+        std::atomic<uint32_t> gMousePacked{ 0xFFFFFFFFu };  // x<<16|y in panel px; sentinel = off-panel
+        std::atomic<bool>     gMouseDown{ false };
+        // Scroll is a HELD DEFLECTION (stick * 1000), not an accumulator.
+        // v1.4.0 dumped one big wheel delta on the single frame following each
+        // ~10 Hz pump tick; ImGui applies a wheel event on exactly one frame and
+        // only if a scrollable window is hovered THAT frame, so a mistimed dump
+        // is silently discarded. Emitting a small delta EVERY frame instead is
+        // both robust to that race and smoother (90 Hz vs 10 Hz granularity).
+        std::atomic<int>      gScrollStick{ 0 };            // stick deflection * 1000
+        std::atomic<uint32_t> gCharQ{ 0 };                  // single-slot char queue (0 = empty)
+        bool gPrevDownRT    = false;   // render-thread-only edge state
+        bool gPrevOnPanelRT = false;
+        bool gCursorForcedRT = false;  // we turned MouseDrawCursor on; restore when the session ends
+        bool gSavedBlockInput = true;  // restored on session end
+        // v1.4.7: SMF lays out in its OWN space (MEASURED: 1024x1024, square).
+        // Forcing 1920x1080 made ImGui compose in 16:9 while SMF sized and
+        // placed its window for 1024x1024, so the menu landed in a sub-rect
+        // whose relationship to the panel is not the identity our pointer
+        // injection assumes -- it agreed only near centre. We now ADOPT SMF's
+        // space: the render thread publishes it, the pump sizes the RT to it,
+        // and pointer pixels are computed against the same numbers.
+        std::atomic<uint32_t> gWantW{ 0 }, gWantH{ 0 };   // what SMF asked for
+        uint32_t gRtW = 0, gRtH = 0;                      // what the RT currently is
+
+        // ---- render target: game-device texture, MISC_SHARED -------------
+        // SMF's DX11 backend paints into this on the render thread; SteamVR
+        // reads it live through the DXGI share opened on OUR device (pump).
+        ID3D11Texture2D*        gTex = nullptr;
+        ID3D11RenderTargetView* gRTV = nullptr;
+        HANDLE                  gShareHandle = nullptr;
+        ID3D11DeviceContext*    gGameCtx = nullptr;   // AddRef'd once, kept for the plugin lifetime
+
+        // ================== render-thread code ============================
+        // Discipline (doc 08): no allocation, no logging, no locking. ImGui's
+        // own internals may allocate - that is the same single ImGui thread
+        // SMF always runs, not a cross-thread hazard of ours.
+        void RenderIntoWrist(void* dd)
+        {
+            if (!dd || !gRTV || !gGameCtx || !gRenderDrawData) return;
+            ID3D11RenderTargetView* oldRTV = nullptr;
+            ID3D11DepthStencilView* oldDSV = nullptr;
+            gGameCtx->OMGetRenderTargets(1, &oldRTV, &oldDSV);
+            UINT nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            gGameCtx->RSGetViewports(&nvp, vps);
+            const float clear[4] = { 0.f, 0.f, 0.f, 0.f };
+            gGameCtx->OMSetRenderTargets(1, &gRTV, nullptr);
+            gGameCtx->ClearRenderTargetView(gRTV, clear);
+            gRenderDrawData(dd);   // the backend sets its own viewport from DisplaySize
+            gGameCtx->OMSetRenderTargets(1, &oldRTV, oldDSV);
+            if (nvp) gGameCtx->RSSetViewports(nvp, vps);
+            if (oldRTV) oldRTV->Release();
+            if (oldDSV) oldDSV->Release();
+        }
+        void HookedFlatDraw(void* dd)
+        {
+            if (gSession.load(std::memory_order_relaxed)) RenderIntoWrist(dd);
+            else if (gOrigFlatDraw) gOrigFlatDraw(dd);
+        }
+        void HookedRenderToPanel(void* self, ID3D11DeviceContext* ctx)
+        {
+            if (!gSession.load(std::memory_order_relaxed)) {
+                if (gOrigRenderToPanel) gOrigRenderToPanel(self, ctx);
+                return;
+            }
+            RenderIntoWrist(gGetDrawData ? gGetDrawData() : nullptr);
+        }
+        bool HookedIsAnyOpenFocusSync()
+        {
+            // Only the two helper focus-sync sites land here. Lying "closed"
+            // during our session keeps the helper's panel out of the scene and
+            // stops its focus mismatch from closing our window every frame.
+            if (gSession.load(std::memory_order_relaxed)) return false;
+            return gIsAnyWindowOpen ? gIsAnyWindowOpen() : false;
+        }
+        void HookedNewFrame()
+        {
+            if (gSession.load(std::memory_order_relaxed) && gGetIO) {
+                NativeIO* io = gGetIO();
+                // Report what SMF/the Win32 backend set BEFORE we override it.
+                // If this is not 1920x1080, our forced DisplaySize changes the
+                // aspect ImGui lays out at -- the prime suspect for a pointer
+                // that diverges from the laser away from panel centre.
+                // Publish SMF's own layout space; the pump sizes the RT to it.
+                // We deliberately do NOT overwrite DisplaySize any more.
+                const uint32_t dw = static_cast<uint32_t>(io->DisplaySizeX);
+                const uint32_t dh = static_cast<uint32_t>(io->DisplaySizeY);
+                if (dw && dh &&
+                    (dw != gWantW.load(std::memory_order_relaxed) ||
+                     dh != gWantH.load(std::memory_order_relaxed))) {
+                    gWantW.store(dw, std::memory_order_relaxed);
+                    gWantH.store(dh, std::memory_order_relaxed);
+                    SKSE::log::info("SMF native: layout space is {}x{} - sizing the wrist RT to match", dw, dh);
+                }
+                io->ConfigFlags &= ~(1 << 4);   // ImGuiConfigFlags_NoMouse - DisableImGuiInput set it this frame
+                // ImGui's own software cursor: the wrist panel has no OS cursor and
+                // the composite dot is PrismaUI-path-only. This arrow is drawn by the
+                // same system consuming our injected coords - a live mapping check.
+                reinterpret_cast<bool*>(io)[gBuild->offMouseDrawCursor] = true;
+                gCursorForcedRT = true;
+                const uint32_t m  = gMousePacked.load(std::memory_order_relaxed);
+                const bool     on = (m != 0xFFFFFFFFu);
+                if (on)                   gAddMousePos(io, float(m >> 16), float(m & 0xFFFFu));
+                else if (gPrevOnPanelRT)  gAddMousePos(io, -FLT_MAX, -FLT_MAX);
+                gPrevOnPanelRT = on;
+                const bool dn = gMouseDown.load(std::memory_order_relaxed);
+                if (dn != gPrevDownRT) { gAddMouseBtn(io, 0, dn); gPrevDownRT = dn; }
+                const int sk = gScrollStick.load(std::memory_order_relaxed);
+                if (sk) {
+                    // Sign matches the PrismaUI path: stick UP scrolls the page DOWN.
+                    // 1000 (full stick) -> 0.1 notches/frame ~= 9 notches/s at 90 Hz.
+                    gAddWheel(io, 0.0f, float(sk) * -0.0001f);
+                }
+                const uint32_t c = gCharQ.exchange(0, std::memory_order_relaxed);
+                if (c) gAddChar(io, c);
+            } else if (gCursorForcedRT && gGetIO && gBuild) {
+                reinterpret_cast<bool*>(gGetIO())[gBuild->offMouseDrawCursor] = false;
+                gCursorForcedRT = false;   // F1/helper sessions keep their stock look
+            }
+            if (gOrigNewFrame) gOrigNewFrame();
+        }
+
+        // ================== install (pump / lifecycle thread) =============
+        bool ValidSite(uintptr_t site, uintptr_t callee)
+        {
+            const auto* c = reinterpret_cast<const uint8_t*>(site);
+            if (c[0] != 0xE8) return false;
+            int32_t rel = 0;
+            std::memcpy(&rel, c + 1, sizeof(rel));
+            return site + 5 + static_cast<intptr_t>(rel) == callee;
+        }
+        bool EnsureNative()
+        {
+            if (gHooked) return true;
+            HMODULE mod = ::GetModuleHandleW(L"SKSEMenuFramework");
+            if (!mod) return false;          // not installed (or not yet mapped) - cheap retry
+            if (gTried) return false;        // installed but we already failed - permanent for this session
+            gTried = true;
+            gBase = reinterpret_cast<uintptr_t>(mod);
+
+            uint32_t ver = 0;
+            if (const auto* pv = reinterpret_cast<const uint8_t*>(::GetProcAddress(mod, "SKSEPlugin_Version")))
+                std::memcpy(&ver, pv + 4, sizeof(ver));
+            for (const auto& b : kSmfBuilds)
+                if (b.version == ver) { gBuild = &b; break; }
+            if (!gBuild) {
+                SKSE::log::warn("SMF native: unknown SKSEMenuFramework version {:#010x} - source disabled "
+                                "(known: 3.13.0). Regenerate offsets with gen_smf_offsets.py.", ver);
+                return false;
+            }
+
+            gGetIO       = reinterpret_cast<GetIO_t>(::GetProcAddress(mod, "igGetIO"));
+            gGetMainWin  = reinterpret_cast<GetMainWin_t>(::GetProcAddress(mod, "GetMainWindow"));
+            gAddMousePos = reinterpret_cast<AddMousePos_t>(::GetProcAddress(mod, "ImGuiIO_AddMousePosEvent"));
+            gAddMouseBtn = reinterpret_cast<AddMouseBtn_t>(::GetProcAddress(mod, "ImGuiIO_AddMouseButtonEvent"));
+            gAddWheel    = reinterpret_cast<AddWheel_t>(::GetProcAddress(mod, "ImGuiIO_AddMouseWheelEvent"));
+            gAddChar     = reinterpret_cast<AddChar_t>(::GetProcAddress(mod, "ImGuiIO_AddInputCharacter"));
+            if (!gGetIO || !gGetMainWin || !gAddMousePos || !gAddMouseBtn || !gAddWheel || !gAddChar) {
+                SKSE::log::error("SMF native: required exports missing - source disabled.");
+                return false;
+            }
+
+            const uintptr_t sites[5]   = { gBuild->siteNewFrame, gBuild->siteFlatDraw, gBuild->siteHelperDraw,
+                                           gBuild->siteFocusSyncA, gBuild->siteFocusSyncB };
+            const uintptr_t callees[5] = { gBuild->rvaNewFrame, gBuild->rvaRenderDrawData, gBuild->rvaRenderToPanel,
+                                           gBuild->rvaIsAnyWindowOpen, gBuild->rvaIsAnyWindowOpen };
+            for (int i = 0; i < 5; ++i) {
+                if (!ValidSite(gBase + sites[i], gBase + callees[i])) {
+                    SKSE::log::error("SMF native: call site {} at {:#x} did not validate (another plugin "
+                                     "patched it, or a repack) - source disabled, nothing written.",
+                                     i, gBase + sites[i]);
+                    return false;   // fail closed: zero of the five hooks installed
+                }
+            }
+
+            auto* dev = reinterpret_cast<::ID3D11Device*>(RE::BSGraphics::Renderer::GetDevice());
+            if (!dev) { SKSE::log::warn("SMF native: no game D3D11 device yet - will retry."); gTried = false; return false; }
+            dev->GetImmediateContext(&gGameCtx);   // AddRef; device methods are free-threaded, context is used only on the render thread
+            // The RT is created lazily by the pump (EnsureRT) once SMF's first
+            // frame tells us its layout space - we cannot know it before then.
+
+            // SEPARATE trampoline: the global one was seeded once for the
+            // PrismaUI hooks and set_trampoline releases the prior buffer.
+            void* mem = AllocNearAddress(gBase + gBuild->siteNewFrame, 256);
+            if (!mem) { SKSE::log::error("SMF native: no trampoline memory in rel32 reach - source disabled."); return false; }
+            static SKSE::Trampoline sTramp;
+            sTramp.set_trampoline(mem, 256, [](void* p, std::size_t) { ::VirtualFree(p, 0, MEM_RELEASE); });
+
+            gIsAnyWindowOpen = reinterpret_cast<IsAnyOpen_t>(gBase + gBuild->rvaIsAnyWindowOpen);
+            gGetDrawData     = reinterpret_cast<GetDrawData_t>(gBase + gBuild->rvaGetDrawData);
+            gRenderDrawData  = reinterpret_cast<RenderDD_t>(gBase + gBuild->rvaRenderDrawData);
+            gOrigNewFrame = reinterpret_cast<NewFrame_t>(
+                sTramp.write_call<5>(gBase + gBuild->siteNewFrame, reinterpret_cast<std::uintptr_t>(&HookedNewFrame)));
+            gOrigFlatDraw = reinterpret_cast<RenderDD_t>(
+                sTramp.write_call<5>(gBase + gBuild->siteFlatDraw, reinterpret_cast<std::uintptr_t>(&HookedFlatDraw)));
+            gOrigRenderToPanel = reinterpret_cast<RenderToPanel_t>(
+                sTramp.write_call<5>(gBase + gBuild->siteHelperDraw, reinterpret_cast<std::uintptr_t>(&HookedRenderToPanel)));
+            sTramp.write_call<5>(gBase + gBuild->siteFocusSyncA, reinterpret_cast<std::uintptr_t>(&HookedIsAnyOpenFocusSync));
+            sTramp.write_call<5>(gBase + gBuild->siteFocusSyncB, reinterpret_cast<std::uintptr_t>(&HookedIsAnyOpenFocusSync));
+
+            gHooked = true;
+            SKSE::log::info("SMF native: armed on SKSEMenuFramework {} (5 call-site hooks, 1920x1080 shared RT).",
+                            gBuild->label);
+            return true;
+        }
+
+        // ================== pump-side session + input =====================
+        // Create/resize the shared render target to SMF's own layout space.
+        // Pump thread only. D3D11 device methods are free-threaded, and the
+        // render thread simply does not draw while the RT is absent.
+        bool EnsureRT(uint32_t w, uint32_t h)
+        {
+            if (!w || !h) return gRTV != nullptr;
+            if (w > 4096) w = 4096;
+            if (h > 4096) h = 4096;
+            if (gRTV && w == gRtW && h == gRtH) return true;
+            auto* dev = reinterpret_cast<::ID3D11Device*>(RE::BSGraphics::Renderer::GetDevice());
+            if (!dev) return false;
+            ID3D11Texture2D*        tex = nullptr;
+            ID3D11RenderTargetView* rtv = nullptr;
+            HANDLE                  sh  = nullptr;
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex)) ||
+                FAILED(dev->CreateRenderTargetView(tex, nullptr, &rtv))) {
+                if (rtv) rtv->Release();
+                if (tex) tex->Release();
+                SKSE::log::error("SMF native: render-target {}x{} creation FAILED.", w, h);
+                return false;
+            }
+            IDXGIResource* res = nullptr;
+            if (SUCCEEDED(tex->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void**>(&res))) && res) {
+                res->GetSharedHandle(&sh);
+                res->Release();
+            }
+            if (!sh) {
+                rtv->Release(); tex->Release();
+                SKSE::log::error("SMF native: no shared handle for {}x{}.", w, h);
+                return false;
+            }
+            ID3D11RenderTargetView* oldRtv = gRTV;
+            ID3D11Texture2D*        oldTex = gTex;
+            gRTV = rtv; gTex = tex; gShareHandle = sh; gRtW = w; gRtH = h;
+            if (oldRtv) oldRtv->Release();
+            if (oldTex) oldTex->Release();
+            SKSE::log::info("SMF native: wrist render target now {}x{} (matches SMF layout space).", w, h);
+            return true;
+        }
+        uint32_t WantW()   { return gWantW.load(std::memory_order_relaxed); }
+        uint32_t WantH()   { return gWantH.load(std::memory_order_relaxed); }
+        uint32_t RtW()     { return gRtW; }
+        uint32_t RtH()     { return gRtH; }
+        bool     RtReady() { return gRTV != nullptr && gRtW && gRtH; }
+
+        bool Available()     { return gHooked; }
+        bool SessionActive() { return gSession.load(std::memory_order_relaxed); }
+        inline bool IsSourceName(const std::string& s_) { return _stricmp(s_.c_str(), kSourceName) == 0; }
+        HANDLE ShareHandle() { return gShareHandle; }
+
+        void PointerMove(int x, int y)
+        {
+            if (x < 0) x = 0; if (y < 0) y = 0;
+            gMousePacked.store((uint32_t(x & 0xFFFF) << 16) | uint32_t(y & 0xFFFF), std::memory_order_relaxed);
+        }
+        void PointerOff()          { gMousePacked.store(0xFFFFFFFFu, std::memory_order_relaxed); }
+        void PointerButton(bool d) { gMouseDown.store(d, std::memory_order_relaxed); }
+        void SetScrollStick(float y)
+        {
+            const int v = static_cast<int>(y * 1000.0f);
+            const int prev = gScrollStick.exchange(v, std::memory_order_relaxed);
+            if ((prev == 0) != (v == 0))
+                SKSE::log::info("SMF native: scroll stick {}", v ? "engaged" : "released");
+        }
+        void PushChar(uint32_t c)  { if (c) gCharQ.store(c, std::memory_order_relaxed); }
+
+        bool WindowStillOpen()
+        {
+            auto* w = gGetMainWin ? gGetMainWin() : nullptr;
+            return w && w->IsOpen.load(std::memory_order_relaxed);
+        }
+        void BeginSession()
+        {
+            if (!gHooked || gSession.load(std::memory_order_relaxed)) return;
+            if (auto* w = gGetMainWin()) {
+                gSavedBlockInput = w->BlockUserInput.load(std::memory_order_relaxed);
+                w->BlockUserInput.store(false, std::memory_order_relaxed);  // never pause: wrist menu is used live
+                w->IsOpen.store(true, std::memory_order_relaxed);           // the SDK-sanctioned open (mods do exactly this)
+            }
+            gPrevDownRT = false;  // benign: render thread reads these only once gSession flips below
+            gPrevOnPanelRT = false;
+            gMouseDown.store(false, std::memory_order_relaxed);
+            gMousePacked.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            gScrollStick.store(0, std::memory_order_relaxed);
+            gSession.store(true, std::memory_order_release);
+            SKSE::log::info("SMF native: session BEGIN (window opened, pause suppressed for this session)");
+        }
+        void EndSession()
+        {
+            if (!gSession.load(std::memory_order_relaxed)) return;
+            gSession.store(false, std::memory_order_release);
+            if (gGetMainWin) {
+                if (auto* w = gGetMainWin()) {
+                    w->IsOpen.store(false, std::memory_order_relaxed);
+                    w->BlockUserInput.store(gSavedBlockInput, std::memory_order_relaxed);
+                }
+            }
+            gMouseDown.store(false, std::memory_order_relaxed);
+            gMousePacked.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            gScrollStick.store(0, std::memory_order_relaxed);
+            SKSE::log::info("SMF native: session END");
+        }
+    }
+
     // ---- MCM setting sources, in MCM Helper's own precedence order --------
     // MCM Helper builds its setting store from INI files ONLY (a ModSetting
     // does not exist until an INI declares it — `defaultValue` in config.json
@@ -1329,9 +1770,55 @@ namespace {
     // at load). Written through MO2's VFS to the same place the settings INI is
     // read from. Dedup count logged so we only rewrite when the set changes.
     int gLastConfigGenCount = -1;
+
+    // ★ The option list must only ever GROW.
+    //
+    // PrismaUI views register LAZILY — SeverActions, for one, does not create
+    // its views until something needs them. So the live view set a few minutes
+    // into a session is a SUBSET of what exists over a full session. An earlier
+    // version rebuilt the dropdown purely from that snapshot and overwrote the
+    // richer list, silently deleting names (observed 2026-09-06: nine
+    // SeverActions entries vanished). That is worse than cosmetic — MCM Helper
+    // renders a stored value that is not in its options list as blank, so a
+    // user whose icon was bound to a dropped name loses the binding in the UI.
+    //
+    // Fix: union the freshly-discovered names with whatever the existing
+    // config.json already offers. Names accumulate and are never removed.
+    std::vector<std::string> ReadExistingConfigOptions()
+    {
+        std::vector<std::string> out;
+        std::ifstream in(".\\Data\\MCM\\Config\\PrismaUIWristOverlays\\config.json",
+                         std::ios::binary);
+        if (!in) return out;
+        std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::string key = "\"options\": [";
+        const size_t b = all.find(key);
+        if (b == std::string::npos) return out;
+        const size_t e = all.find(']', b);
+        if (e == std::string::npos) return out;
+        const std::string arr = all.substr(b + key.size(), e - b - key.size());
+        // Pull each "quoted" entry.
+        size_t i = 0;
+        while (true) {
+            const size_t q1 = arr.find('"', i);
+            if (q1 == std::string::npos) break;
+            const size_t q2 = arr.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            std::string v = arr.substr(q1 + 1, q2 - q1 - 1);
+            // Auto/Off/SMF are re-added unconditionally below; skip them here.
+            if (!v.empty() && v != "Auto" && v != "Off" && v != smf::kSourceName) {
+                if (std::find(out.begin(), out.end(), v) == out.end()) out.push_back(v);
+            }
+            i = q2 + 1;
+        }
+        return out;
+    }
+
     void WriteMcmConfigJson(const std::vector<ViewEntry>& views)
     {
-        std::vector<std::string> names;
+        // Start from what the menu ALREADY offers so nothing is ever dropped.
+        std::vector<std::string> names = ReadExistingConfigOptions();
+        const size_t carriedOver = names.size();
         for (const auto& v : views) {
             std::string n = OverlayShortName(v.url);
             if (n.empty()) continue;
@@ -1345,6 +1832,11 @@ namespace {
             return o;
         };
         std::string opts = "\"Auto\", \"Off\"";
+        // The SKSE Menu Framework is a permanent extra source whenever the
+        // ImGui VR Helper is present — it is not a PrismaUI view, so it never
+        // appears in `views`; it is one entry covering every mod that
+        // registers a menu inside SMF.
+        if (smf::Available()) { opts += ", \""; opts += esc(smf::kSourceName); opts += "\""; }
         for (const auto& n : names) { opts += ", \""; opts += esc(n); opts += "\""; }
 
         auto iconCtl = [&](const char* id, const char* text, const char* autoDesc) {
@@ -1382,7 +1874,9 @@ namespace {
         if (out) {
             out << j;
             out.close();
-            SKSE::log::info("Regenerated MCM config.json ({} overlay options)", names.size());
+            SKSE::log::info("Regenerated MCM config.json ({} overlay options; {} carried over "
+                            "from the previous list, {} live views this pass)",
+                            names.size(), carriedOver, views.size());
         } else {
             SKSE::log::warn("Could not open config.json to regenerate the overlay list");
         }
@@ -1468,6 +1962,25 @@ namespace {
     int BindSlotsToViews(const std::vector<ViewEntry>& views)
     {
         int newlyBound = 0;
+
+        // SMF slots resolve before the PrismaUI matching below: the source is
+        // not a view, so there is nothing to match by URL. A slot bound to SMF
+        // simply flags itself; the pump then takes the helper-panel path.
+        for (int i = 0; i < Slot_Count; ++i) {
+            const bool wantSmf = smf::IsSourceName(gIconBind[i]) && smf::Available();
+            if (wantSmf != gSlotIsSmf[i]) {
+                gSlotIsSmf[i] = wantSmf;
+                SKSE::log::info("Slot[{}] source = {}", i,
+                                wantSmf ? "SKSE Menu Framework (via ImGui VR Helper)"
+                                        : "PrismaUI view");
+            }
+            if (wantSmf) {
+                // Mark it satisfied so the discovery loop stops hunting for a
+                // PrismaUI view for this slot, and clear any stale view state.
+                gSlotViewIds[i]       = 0;
+                gSlotActiveViewIds[i] = 0;
+            }
+        }
 
         // Refresh the per-icon NAME bindings from the MCM settings INI.
         ReadIconBindings();
@@ -2732,7 +3245,8 @@ namespace {
     // Position the cursor at a 3D hit point, slightly toward the HMD so it
     // doesn't z-fight with the hit surface, billboarded so it faces the user.
     void ShowCursorAt(vr::IVROverlay* overlay, vr::IVRSystem* system,
-                     const vr::HmdVector3_t& hitPoint)
+                     const vr::HmdVector3_t& hitPoint,
+                     float towardHmd = kCursorTowardHmdOffset)
     {
         if (gCursorOvl == vr::k_ulOverlayHandleInvalid) return;
 
@@ -2749,9 +3263,9 @@ namespace {
             float tx = hx - wx, ty = hy - wy, tz = hz - wz;
             float l = std::sqrt(tx*tx + ty*ty + tz*tz);
             if (l > 1e-4f) {
-                wx += kCursorTowardHmdOffset * (tx / l);
-                wy += kCursorTowardHmdOffset * (ty / l);
-                wz += kCursorTowardHmdOffset * (tz / l);
+                wx += towardHmd * (tx / l);
+                wy += towardHmd * (ty / l);
+                wz += towardHmd * (tz / l);
             }
         }
 
@@ -3580,6 +4094,8 @@ namespace {
                 gPressedOn = Hit_Icon;
                 gPressedIconSlot = bestIcon;
                 SKSE::log::info("Icon[{}] clicked: slot {} -> {}", bestIcon, cur, nxt);
+                if (smf::SessionActive() && (nxt < 0 || nxt >= Slot_Count || !gSlotIsSmf[nxt]))
+                    smf::EndSession();   // switched away from the SMF slot
             } else if (hitKind == Hit_Panel) {
                 // Forward mouseDown to the slot's CURRENTLY-DISPLAYED view.
                 int activeSlot = gActiveSlot.load();
@@ -3592,6 +4108,12 @@ namespace {
                 if (viewId != 0 && panelPx >= 0 && gFireMouse) {
                     gFireMouse(viewId, 1 /*down*/, panelPx, panelPy, 1 /*left*/);
                     SKSE::log::info("Panel click DOWN at ({},{}) trig={:.2f}", panelPx, panelPy, trig);
+                }
+                if (viewId == 0 && activeSlot >= 0 && gSlotIsSmf[activeSlot] &&
+                    smf::SessionActive() && panelPx >= 0) {
+                    smf::PointerMove(panelPx, panelPy);
+                    smf::PointerButton(true);
+                    SKSE::log::info("Panel click DOWN (SMF native) at ({},{})", panelPx, panelPy);
                 }
                 gPressedOn = Hit_Panel;
             }
@@ -3629,6 +4151,9 @@ namespace {
                 InjectPointerEvent(viewId, "rclick", panelPx, panelPy, bmpW, bmpH);
                 SKSE::log::info("Panel RIGHT-click (A button) at ({},{})", panelPx, panelPy);
             }
+            if (viewId == 0 && gSlotIsSmf[activeSlot] && smf::SessionActive() && panelPx >= 0) {
+                smf::PointerMove(panelPx, panelPy);
+            }
             gLastPixelX    = panelPx;
             gLastPixelY    = panelPy;
             gLastHitU      = panelRes.vUVs.v[0];   // for the resolution-safe cursor draw
@@ -3636,7 +4161,13 @@ namespace {
             gLastHitPoint  = panelRes.vPoint;
             gLastHitNormal = panelRes.vNormal;
             gHadHitLast    = true;  // bitmap cursor draws on next panel submit
-            HideCursor(overlay);
+            // SMF native panels have no CPU bitmap to composite the yellow dot
+            // into, so reuse the world-space cursor overlay (the same dot the
+            // icons use) at the raycast hit point instead.
+            if (activeSlot >= 0 && activeSlot < Slot_Count && gSlotIsSmf[activeSlot] && smf::SessionActive())
+                ShowCursorAt(overlay, system, panelRes.vPoint, 0.0025f);
+            else
+                HideCursor(overlay);
         } else if (hitKind == Hit_Icon) {
             gHadHitLast = false;
             ShowCursorAt(overlay, system, iconRes[bestIcon].vPoint);
@@ -3671,6 +4202,7 @@ namespace {
                     SKSE::log::info("Panel click UP at ({},{}) trig={:.2f}", gLastPixelX, gLastPixelY, trig);
                 }
             }
+            if (gPressedOn == Hit_Panel) smf::PointerButton(false);   // harmless no-op for PrismaUI slots
             gPressedOn = Hit_None;
             gPressedIconSlot = Slot_None;
             gTriggerHeld = false;
@@ -3685,6 +4217,10 @@ namespace {
         // switches and 10 Hz-rate UI lag overlapping player movement.
         if (stateOk && hitKind == Hit_Panel && !gResizing) {
             const int activeSlot = gActiveSlot.load();
+            if (activeSlot >= 0 && activeSlot < Slot_Count && gSlotIsSmf[activeSlot] && smf::SessionActive()) {
+                const float jySmf = state.rAxis[kArrowKeyAxis].y;
+                smf::SetScrollStick(std::fabs(jySmf) > kJoystickDeadzone ? jySmf : 0.0f);
+            }
             const uint64_t viewId = (activeSlot >= 0 && activeSlot < Slot_Count) ? gSlotActiveViewIds[activeSlot] : 0;
             if (viewId != 0) {
                 const float jy = state.rAxis[kArrowKeyAxis].y;
@@ -3900,6 +4436,11 @@ namespace {
             // (auto-heals a view whose page reloaded). Binding is idempotent —
             // Pass 1 skips already-bound slots — so repeating it is safe. The
             // verbose per-view log is gated on a count change so it doesn't spam.
+            // SMF source: keep retrying the helper handshake and client
+            // discovery — the helper may register after us, and SMF only
+            // gets a panel once it has drawn its first frame.
+            smf::EnsureNative();
+
             if (--rediscoverCountdown <= 0) {
                 rediscoverCountdown = 20;  // 2s
                 auto views = EnumerateViews();
@@ -4041,6 +4582,12 @@ namespace {
                 if (cw && ch && cs) { w = cw; h = ch; stride = cs; }
             }
 
+            // SMF slots map the pointer against SMF's own layout space, not the
+            // PrismaUI bitmap size -- see the v1.4.7 note in namespace smf.
+            if (activeSlot >= 0 && activeSlot < Slot_Count && gSlotIsSmf[activeSlot] &&
+                smf::RtReady()) {
+                w = smf::RtW(); h = smf::RtH(); stride = w * 4;
+            }
             ProcessRaycast(overlay, w, h);
 
             // --- 5a½) Right-stick guard, gated on the yellow dot ----------
@@ -4082,17 +4629,41 @@ namespace {
             if (focusedNow && !gKeyboardOpen && !gKbdAutoSuppressed &&
                 ((gDeliverCharToView && gDeliverVKeyToView) || gStockBuild))
             {
+                // ★★ FLAGS MUST BE 0 — never KeyboardFlag_Minimal.
+                //
+                // SteamVR's system keyboard is a SINGLETON owned by vrserver, not
+                // by the calling process. KeyboardFlag_Minimal switches that shared
+                // keyboard to "send keys immediately, accumulate no buffer", which
+                // (a) removes the text-preview band along its top and (b) makes
+                // GetKeyboardText() return an empty string.
+                //
+                // That broke every OTHER mod's text entry system-wide (reported
+                // 2026-09-07: AddItemMenu VR + RaceMenu). Those mods follow the
+                // normal contract — show the keyboard, wait for Done, then read the
+                // accumulated buffer — so an empty buffer means their Papyrus poll
+                // loop (VRKeyboard.psc: `while ! resultText`) never exits. And
+                // because the mode lives in vrserver, DISABLING our mod does not
+                // undo it; only a SteamVR restart or a normal-mode show does.
+                //
+                // 0 = the default, well-behaved keyboard: band visible, buffer kept.
+                // We still receive VREvent_KeyboardCharInput per keystroke, and the
+                // Done handler below also reads the whole buffer as a fallback, so
+                // our own typing works in either mode.
                 auto err = overlay->ShowKeyboardForOverlay(
                     gPanelOvl,
                     vr::k_EGamepadTextInputModeNormal,
                     vr::k_EGamepadTextInputLineModeSingleLine,
-                    vr::KeyboardFlag_Minimal,
+                    vr::KeyboardFlag_Modal /* see the 2026-09-07 note below */,
                     "PrismaUI",
                     256,
                     "",
                     kKbdUserValue);
                 if (err == vr::VROverlayError_None) {
                     gKeyboardOpen = true;
+                    gKbdCharsThisSession = 0;
+                    gKbdRealCharsThisSession = 0;
+                    gKbdLastLiveText.clear();
+                    gKbdHarvested.clear();
                     SKSE::log::info("Keyboard: auto-summoned for slot {} (input focused)",
                         kbdSlotActive);
                 } else {
@@ -4111,7 +4682,21 @@ namespace {
             // disturb anything else in the process that might poll the global
             // event stream via PollNextEvent. ShowKeyboardForOverlay routes
             // keyboard events to the targeted overlay's queue.
-            if (gPanelOvl != vr::k_ulOverlayHandleInvalid) {
+            //
+            // ★★ ONLY drain while WE actually have a keyboard session open.
+            //
+            // This used to run every tick unconditionally, and that broke OTHER
+            // mods' text entry (reported 2026-09-06: AddItemMenu VR accepted no
+            // typed text). Once we have called ShowKeyboardForOverlay(gPanelOvl)
+            // even once, SteamVR keeps routing system-keyboard events to that
+            // overlay's queue; draining it while idle meant we SWALLOWED
+            // characters meant for whoever summoned the keyboard next, and then
+            // threw them away (ForwardKeyboardInput returns immediately on a
+            // zero target view). Silent, total input loss for the other mod.
+            //
+            // Not polling is the correct fix rather than filtering: an event we
+            // never consume stays in the queue for its rightful owner.
+            if (gKeyboardOpen && gPanelOvl != vr::k_ulOverlayHandleInvalid) {
                 // Keyboard events route to the view of the slot active when
                 // the keyboard was summoned. If the user switches slots mid-
                 // typing we still send to the current active slot — but the
@@ -4119,12 +4704,48 @@ namespace {
                 // since the new slot's text-focus flag won't be set.
                 const uint64_t kbdTargetView =
                     (kbdSlotActive >= 0 && kbdSlotActive < Slot_Count) ? gSlotActiveViewIds[kbdSlotActive] : 0;
+                // --- LIVE BUFFER PROBE (2026-09-07) -------------------------
+                // The user reports the SteamVR keyboard clicks audibly on the
+                // FIRST keypress only, and GetKeyboardText always ends up holding
+                // exactly the LAST character typed ("SOFIA"->'a', "abc"->'c').
+                // Two very different causes produce that end state:
+                //   (A) no accumulation  -- buffer REPLACES per key:  s, o, f, i, a
+                //   (B) something clears -- buffer grows then resets: s, so, '', o
+                // Polling the live buffer every tick and logging only on CHANGE
+                // distinguishes them; the Done snapshot alone cannot.
                 vr::VREvent_t ev{};
                 while (overlay->PollNextOverlayEvent(gPanelOvl, &ev, sizeof(ev))) {
                     switch (ev.eventType) {
-                        case vr::VREvent_KeyboardCharInput:
+                        case vr::VREvent_KeyboardCharInput: {
+                            ++gKbdCharsThisSession;   // events seen (real or empty)
+                            // DIAGNOSTIC (2026-09-07): SteamVR's keyboard lost its text
+                            // band system-wide, which empties the GetKeyboardText buffer.
+                            // The per-keystroke event path is independent of that buffer,
+                            // so log the first few to prove whether it still fires.
+                            // 2026-09-07: observed 8 events ALL carrying 0x00 in byte 0
+                            // while GetKeyboardText still held real text. Dump all 8 bytes
+                            // (cNewInput is 7 UTF-8 bytes + NUL) to see whether the char
+                            // simply lands at another offset, plus uUserValue to confirm
+                            // the event is ours.
+                            if (gKbdCharsThisSession <= 12) {
+                                const unsigned char* b =
+                                    reinterpret_cast<const unsigned char*>(ev.data.keyboard.cNewInput);
+                                SKSE::log::info(
+                                    "Keyboard: CharInput #{} bytes=[{:02x} {:02x} {:02x} {:02x} "
+                                    "{:02x} {:02x} {:02x} {:02x}] user={} age={:.3f}",
+                                    gKbdCharsThisSession,
+                                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                    ev.data.keyboard.uUserValue, ev.eventAgeSeconds);
+                            }
+                            // Only a REAL character counts. An empty event must not
+                            // suppress the Done-buffer fallback below -- that bug made us
+                            // discard text SteamVR had actually accumulated for us.
+                            if (ev.data.keyboard.cNewInput[0] == '\0')
+                                break;
+                            ++gKbdRealCharsThisSession;
                             ForwardKeyboardInput(kbdTargetView, ev.data.keyboard.cNewInput);
                             break;
+                        }
                         case vr::VREvent_KeyboardClosed:
                             // User explicitly dismissed — suppress auto-resummon
                             // while the same input is still focused. Next rising
@@ -4133,13 +4754,114 @@ namespace {
                             gKbdAutoSuppressed = true;
                             SKSE::log::info("Keyboard: closed by user (X button); auto-summon suppressed until next focus");
                             break;
-                        case vr::VREvent_KeyboardDone:
+                        case vr::VREvent_KeyboardDone: {
+                            // Normal (non-minimal) mode keeps a buffer, and some
+                            // runtimes deliver the text ONLY that way. Read it and
+                            // forward anything we did not already receive as
+                            // per-character events, so typing works in both modes.
+                            char buf[512]{};
+                            const uint32_t n = overlay->GetKeyboardText(buf, sizeof(buf));
+                            // DIAGNOSTIC: unconditional, so an EMPTY buffer is visible too.
+                            // charEvents>0 + len=0  => per-key path alive, buffer dead
+                            //                          (we can rebuild text ourselves).
+                            // charEvents=0 + len=0  => SteamVR sends no text at all.
+                            {
+                                const uint32_t shown = (n < sizeof(buf) - 1) ? n : sizeof(buf) - 1;
+                                SKSE::log::info(
+                                    "Keyboard: DIAG on Done -- CharInput events={}, "
+                                    "GetKeyboardText len={}, text='{}'",
+                                    gKbdCharsThisSession, n, std::string(buf, shown));
+                                SKSE::log::info("Keyboard: DIAG real (non-empty) chars={}",
+                                    gKbdRealCharsThisSession);
+                            }
+                            if (n > 0 && kbdTargetView != 0 && gKbdRealCharsThisSession == 0) {
+                                buf[(n < sizeof(buf)) ? n : sizeof(buf) - 1] = '\0';
+                                for (const char* c = buf; *c; ++c) {
+                                    const char one[2] = { *c, '\0' };
+                                    ForwardKeyboardInput(kbdTargetView, one);
+                                }
+                                SKSE::log::info("Keyboard: delivered {} buffered chars on Done", n);
+                            }
+                            // HideKeyboard() is GLOBAL — it dismisses whatever
+                            // system keyboard is up, whoever owns it. Reaching
+                            // here already implies gKeyboardOpen, i.e. the
+                            // session is ours; clear the flag FIRST so no later
+                            // path can call it again on someone else's keyboard.
                             gKeyboardOpen = false;
                             overlay->HideKeyboard();
                             SKSE::log::info("Keyboard: done (Enter/submit)");
                             break;
+                        }
                         default:
                             break;
+                    }
+                }
+                // NOTE (2026-09-07): this MUST run AFTER the event drain above.
+                // The harvest is gated on gKbdRealCharsThisSession, which the drain
+                // increments. Running it first reads a stale zero, so on a healthy
+                // runtime BOTH paths deliver the same keystroke -- double-typing.
+                // --- PER-TICK CHARACTER HARVEST (2026-09-07) -----------------
+                // MEASURED on this machine with a native probe, Skyrim closed and
+                // NO mods loaded (scratchpad/kbprobe):
+                //   * VREvent_KeyboardCharInput fires per key but cNewInput is ALL
+                //     ZERO -- no character is ever delivered in the event. The
+                //     neighbouring uUserValue reads back perfectly, so the struct
+                //     is unpacked correctly; SteamVR simply sends no payload.
+                //   * GetKeyboardText NEVER ACCUMULATES. It holds exactly ONE
+                //     character -- the newest. Typing "abcd" gives 'a','b','c','d'
+                //     on successive polls, never "ab" or "abcd". That is
+                //     KeyboardFlag_Minimal behaviour even though we ask for Modal.
+                // So neither documented path yields a string. What DOES work is
+                // sampling the one-character buffer every tick and appending each
+                // change -- the characters are real, they just live for one poll.
+                // LIMITATION: a key pressed and replaced between two ticks is
+                // missed. Acceptable for laser-clicked VR typing; would not be for
+                // a fast physical typist.
+                {
+                    char live[512]{};
+                    const uint32_t ln = overlay->GetKeyboardText(live, sizeof(live));
+                    const uint32_t lshow = (ln < sizeof(live) - 1) ? ln : sizeof(live) - 1;
+                    std::string cur(live, lshow);
+                    if (cur != gKbdLastLiveText) {
+                        // MEASURED 2026-09-07 (native probe, no game, no mods):
+                        // under KeyboardFlag_Modal, Enter does NOT raise
+                        // VREvent_KeyboardDone here -- it lands as a newline in the
+                        // one-character buffer like any other key. So the newline IS
+                        // the submit signal; waiting on Done would hang forever.
+                        if (cur.size() == 1 && (cur[0] == '\n' || cur[0] == '\r')) {
+                            SKSE::log::info("Keyboard: newline == submit; delivered {} chars",
+                                gKbdHarvested.size());
+                            gKeyboardOpen = false;
+                            overlay->HideKeyboard();
+                            gKbdAutoSuppressed = true;
+                            gKbdLastLiveText.clear();
+                            gKbdHarvested.clear();
+                        } else if (gKbdRealCharsThisSession == 0) {
+                            // Only harvest when the runtime is NOT delivering
+                            // characters in the events. Two buffer shapes exist:
+                            //   healthy  : ACCUMULATES  "a" -> "ab" -> "abc"
+                            //              (SteamVR beta, and stable before the
+                            //              2026-09 regression) -> take the new tail
+                            //   broken   : holds ONE char, replaced every key
+                            //              (SteamVR stable 2026-09) -> take that char
+                            // Handling both means one build works on either runtime.
+                            std::string add;
+                            if (cur.size() > gKbdHarvested.size() &&
+                                cur.compare(0, gKbdHarvested.size(), gKbdHarvested) == 0) {
+                                add = cur.substr(gKbdHarvested.size());
+                            } else if (cur.size() == 1) {
+                                add = cur;
+                            }
+                            for (const char c : add) {
+                                const char one[2] = { c, '\0' };
+                                if (kbdTargetView != 0)
+                                    ForwardKeyboardInput(kbdTargetView, one);
+                                gKbdHarvested += c;
+                            }
+                        }
+                        SKSE::log::info("Keyboard: harvested '{}' -> \"{}\"",
+                            cur, gKbdHarvested);
+                        gKbdLastLiveText = cur;
                     }
                 }
             }
@@ -4264,6 +4986,20 @@ namespace {
                 gCapWantView.store(0, std::memory_order_relaxed);
                 gStickLingerTicks = 0;
                 SetStickSuppressed(false);  // panel closed — stick guard off
+                // Give the system keyboard back. Holding a session open while
+                // our panel is closed is what let us intercept other mods'
+                // typing; release it the moment we stop showing anything.
+                if (gKeyboardOpen) {
+                    gKeyboardOpen = false;
+                    overlay->HideKeyboard();
+                    SKSE::log::info("Keyboard: released (panel closed)");
+                }
+                gKbdAutoSuppressed      = false;
+                gFocusLastForActiveSlot = false;
+                // End any native-SMF session and force the PrismaUI path to
+                // re-bind its own shared texture (they share one panel overlay).
+                smf::EndSession();
+                gTextureBoundToOverlay = false;
                 lastActiveSlotSeen = Slot_None;
                 continue;
             }
@@ -4350,6 +5086,82 @@ namespace {
                 // (a sub-view opened via tab starts at the fork default size).
                 ApplyZoom(curActive, overlay);
                 ApplyResolution(curActive);
+            }
+
+            // --- 6a½) SMF SOURCE (native): SMF's hooked frame paints into a
+            // game-device MISC_SHARED texture; the wrist overlay reads it LIVE
+            // through the DXGI share opened on OUR device. The pump never
+            // touches the game device context - the v1.3.x deadlock class
+            // (device lock held across a compositor call) cannot recur.
+            if (gSlotIsSmf[curActive]) {
+                if (!smf::Available()) {
+                    if (gPanelShownLast) { overlay->HideOverlay(gPanelOvl); gPanelShownLast = false; }
+                    continue;
+                }
+                if (!smf::SessionActive()) {
+                    smf::BeginSession();
+                } else if (!smf::WindowStillOpen()) {
+                    // Closed from inside SMF (its own close button / Escape on
+                    // the desktop) - release the slot instead of forcing it back.
+                    smf::EndSession();
+                    gActiveSlot.store(Slot_None);
+                    if (gPanelShownLast) { overlay->HideOverlay(gPanelOvl); gPanelShownLast = false; }
+                    SKSE::log::info("SMF native: window closed from inside - slot released");
+                    continue;
+                }
+                if (!gHadHitLast) { smf::PointerOff(); smf::SetScrollStick(0.0f); }  // laser left the panel
+                // Size the wrist RT to SMF's own layout space (learned on its
+                // first frame). Until that exists there is nothing to show.
+                smf::EnsureRT(smf::WantW(), smf::WantH());
+                if (!smf::RtReady()) {
+                    if (gPanelShownLast) { overlay->HideOverlay(gPanelOvl); gPanelShownLast = false; }
+                    continue;
+                }
+                // Open the share on OUR device once; each tick we then PULL the
+                // latest frame into gSharedTex (same-device GPU copy) so the SMF
+                // panel rides the one overlay binding whose live-update path every
+                // PrismaUI slot already proves.
+                // Re-open the alias whenever the share handle changes (an RT
+                // resize makes a new texture, hence a new handle).
+                static ID3D11Texture2D* sAlias = nullptr;
+                static HANDLE           sAliasFor = nullptr;
+                if (sAlias && sAliasFor != smf::ShareHandle()) {
+                    sAlias->Release(); sAlias = nullptr;
+                }
+                if (!sAlias && gD3DDevice && smf::ShareHandle()) {
+                    sAliasFor = smf::ShareHandle();
+                    if (FAILED(gD3DDevice->OpenSharedResource(smf::ShareHandle(),
+                            __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&sAlias)))) {
+                        static bool sOpenFailLogged = false;
+                        if (!sOpenFailLogged) {
+                            sOpenFailLogged = true;
+                            SKSE::log::error("SMF native: OpenSharedResource failed - panel stays blank.");
+                        }
+                        sAlias = nullptr;
+                    } else {
+                        SKSE::log::info("SMF native: shared render target opened on the overlay device.");
+                    }
+                }
+                if (sAlias) {
+                    // v1.4.2 FIELD FIX: SteamVR dedups SetOverlayTexture by handle
+                    // and takes its copy of a foreign-device texture ONCE - binding
+                    // the game-device alias froze the panel at its first frame (it
+                    // only refreshed when a slot switch swapped the binding). So:
+                    // same-device GPU copy into gSharedTex + Flush, per tick.
+                    if (EnsureSharedTexSize(smf::RtW(), smf::RtH()) && gSharedTex && gD3DContext) {
+                        gD3DContext->CopyResource(gSharedTex, sAlias);
+                        gD3DContext->Flush();   // commit before the compositor's next read
+                        if (!gTextureBoundToOverlay) {
+                            BindSharedTextureToPanel(overlay);
+                        }
+                        if (!gPanelShownLast) {
+                            overlay->ShowOverlay(gPanelOvl);
+                            gPanelShownLast = true;
+                            SKSE::log::info("Panel shown (slot {} = SKSE Menu Framework, native)", curActive);
+                        }
+                    }
+                }
+                continue;   // SMF owns this slot's frame; skip the PrismaUI path
             }
 
             // --- 6b) No bound view -> SYNTHETIC panel content -------------
@@ -4857,9 +5669,18 @@ namespace {
 
     void HideAllOverlays()
     {
+        smf::EndSession();   // release the SMF window/pause state with the overlays
         gCapWantView.store(0, std::memory_order_relaxed);  // stop addon-mode capture
         gStickLingerTicks = 0;
         SetStickSuppressed(false);                        // never leave the stick guard on
+        // Never leave a system-keyboard session held across a load — it would
+        // keep routing other mods' typed characters into our (now dead) queue.
+        if (gKeyboardOpen) {
+            gKeyboardOpen = false;
+            if (auto* ov2 = vr::VROverlay()) ov2->HideKeyboard();
+        }
+        gKbdAutoSuppressed      = false;
+        gFocusLastForActiveSlot = false;
         // Nothing to hide if we never created overlays — and under OCU the
         // vr::VROverlay() call itself must never happen (IVROverlay_028 abort).
         if (!gOverlayCreated) return;
@@ -4888,6 +5709,14 @@ namespace {
                 SKSE::log::info("kPostLoad — no fork API; attempting stock-PrismaUI addon mode");
                 if (InitStockPrismaMode()) gPrismaReady = true;
             }
+            break;
+
+        case SKSE::MessagingInterface::kPostPostLoad:
+            // Documented safe point for the ImGui VR Helper handshake: it fires
+            // after every plugin's kPostLoad, so the helper's listener exists
+            // regardless of load order. Retryable — the pump re-tries below.
+            SKSE::log::info("kPostPostLoad — arming the native SKSE Menu Framework source");
+            smf::EnsureNative();
             break;
 
         case SKSE::MessagingInterface::kInputLoaded:
