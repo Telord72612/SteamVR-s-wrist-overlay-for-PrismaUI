@@ -30,7 +30,7 @@ under PrismaUI's license (§3.2 forbids redistributing a modified PrismaUI).
 - A **SteamVR-native** runtime. Under OpenComposite this mod stays dormant by
   design — PrismaUI's own OCU path handles VR there.
 - **At least one source to display**, either or both:
-  - **PrismaUI 1.4.1 or 1.5.0 RC** (stock, from Nexus) + a PrismaUI overlay mod
+  - **PrismaUI 1.4.1, 1.5.0 RC or 1.5.0** (stock, from Nexus) + a PrismaUI overlay mod
     (SkyrimNet, SeverActions, …)
   - **SKSE Menu Framework 3.13.0** + any mod that registers a menu with it
 
@@ -67,7 +67,7 @@ Startup lines in `My Games/Skyrim VR/SKSE/PrismaUISteamVR.log`:
 | Line | Meaning |
 |---|---|
 | `addon mode ACTIVE: pixel hook installed …` | Good — wrist panels will show real PrismaUI content. |
-| `addon mode: PrismaUI version X is NOT a known build — installing NOTHING` | Unsupported PrismaUI version; icons appear, panels show a test pattern. |
+| `addon mode: PrismaUI version X is NOT a known build — installing NOTHING` | Unsupported PrismaUI version; icons appear, panels show a test pattern. If it adds *"the version is known, but this is a DIFFERENT binary of it"*, PrismaUI was re-released under the same version number and needs a new row. |
 | `SMF native: armed on SKSEMenuFramework 3.13.0 (5 call-site hooks…)` | Good — the SKSE Menu Framework source is live. |
 | `SMF native: unknown SKSEMenuFramework version … - source disabled` | Unsupported SMF version; nothing patched, SMF untouched. |
 | `SMF native: layout space is WxH - sizing the wrist RT to match` | Normal — the panel adopts SMF's own menu dimensions. |

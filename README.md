@@ -24,7 +24,7 @@ Works on the **stock, unmodified PrismaUI from Nexus**, and on **stock SKSE Menu
 - **SkyrimVR ESL Support** (`skyrimvresl`) — the plugin is ESL-flagged
 - A **SteamVR-native** runtime. Under OpenComposite this mod stays dormant on purpose — PrismaUI 1.5+ has its own OCU path there.
 - **At least one source to display**, either:
-  - **PrismaUI 1.4.1 or 1.5.0 RC** (stock, from Nexus) plus a PrismaUI-based overlay mod, and/or
+  - **PrismaUI 1.4.1, 1.5.0 RC or 1.5.0** (stock, from Nexus) plus a PrismaUI-based overlay mod, and/or
   - **SKSE Menu Framework 3.13.0** plus any mod that registers a menu with it
 
 Both frameworks are optional and independent — install either, or both.
@@ -75,12 +75,13 @@ Every hook site is verified before patching (the instruction must be a call reso
 
 ## Version support
 
-The plugin identifies the exact build of each framework at startup from a compiled-in offset table.
+The plugin identifies the exact build of each framework at startup from a compiled-in offset table. PrismaUI builds are keyed by version **plus** the DLL's PE `TimeDateStamp` and `SizeOfImage` — the version word alone is not unique (1.5.0 RC and 1.5.0 final both report `0x01050000` with every address moved).
 
 | PrismaUI | Status |
 |---|---|
 | 1.4.1 | ✅ Supported |
 | 1.5.0 RC | ✅ Supported (seams re-verified against the 1.5 source; exactly one call site per hook, same lock/signature contracts) |
+| 1.5.0 (final, Nexus "Prisma UI 1.5") | ✅ Supported since 2.0.1 (decorated signatures of every hooked function and global identical to the RC; exactly one call site per hook) |
 | anything else | Fails closed — icons appear, panels show a test pattern, PrismaUI untouched |
 
 | SKSE Menu Framework | Status |
@@ -88,7 +89,7 @@ The plugin identifies the exact build of each framework at startup from a compil
 | 3.13.0 | ✅ Supported |
 | anything else | Fails closed — the SMF source disables itself, logs the version it saw, and patches nothing |
 
-Supporting a new release takes one run of the matching offline generator — [`tools/gen_offsets.py`](tools/gen_offsets.py) for PrismaUI, [`tools/gen_smf_offsets.py`](tools/gen_smf_offsets.py) for SMF — against that release's DLL + PDB (both ship their PDB alongside), pasting the emitted row into `kPrismaBuilds` / `kSmfBuilds` in `src/main.cpp`, and rebuilding. Offsets are generated offline — nothing is parsed at runtime.
+Supporting a new release takes the matching offline generators — [`tools/gen_offsets.py`](tools/gen_offsets.py) + [`tools/find_prisma_callsites.py`](tools/find_prisma_callsites.py) for PrismaUI (functions/globals, then the call sites and PE identity), [`tools/gen_smf_offsets.py`](tools/gen_smf_offsets.py) for SMF — run against that release's DLL + PDB (both ship their PDB alongside), pasting the emitted row into `kPrismaBuilds` / `kSmfBuilds` in `src/main.cpp`, and rebuilding. Validate `find_prisma_callsites.py` against a build whose row is already known (`--expect`) before trusting it on a new one. Offsets are generated offline — nothing is parsed at runtime.
 
 ## Building from source
 

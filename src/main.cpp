@@ -652,6 +652,11 @@ namespace {
     // ======================================================================
     struct PrismaBuild {
         uint32_t    version;            // SKSEPlugin_Version pluginVersion
+        // PE identity. The version alone is NOT a build identity: 1.5.0 RC and
+        // 1.5.0 final both report 0x01050000 with every RVA moved. These two
+        // header fields are read from the MAPPED module, so no file access.
+        uint32_t    timeDateStamp;      // IMAGE_FILE_HEADER::TimeDateStamp
+        uint32_t    sizeOfImage;        // IMAGE_OPTIONAL_HEADER64::SizeOfImage
         const char* label;
         uintptr_t   rvaCopyPixels;      // ViewRenderer::CopyPixelsToTexture (callee)
         uintptr_t   rvaCopyPixelsCall;  // the ONE E8 call site invoking it
@@ -668,7 +673,7 @@ namespace {
     constexpr PrismaBuild kPrismaBuilds[] = {
         // 1.4.1.0 — Nexus "Prisma UI - Next-Gen Web UI Framework"
         // sha256 5C6DA41F…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 16
-        { 0x01040010, "1.4.1.0", 0x91B40, 0x93880, 0x1AA108, 0x1AA128, 0x038,
+        { 0x01040010, 0x69C6DCDF, 0x1C7000, "1.4.1.0", 0x91B40, 0x93880, 0x1AA108, 0x1AA128, 0x038,
           0x926C0, 0x92F39, 0xBFA50, 0x5D56F, false },
         // 1.5.0.0 RC — adds upstream's own OCU VR path + gamepad support.
         // sha256 5D76BF9E…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 24.
@@ -681,8 +686,23 @@ namespace {
         // Exhaustive E8 scans: exactly ONE caller for each callee below; the
         // screen-size call site is followed by `mov [rip+…], rax` targeting
         // Core::screenSize (0x1CD570) — the one write that sizes new views.
-        { 0x01050000, "1.5.0 RC", 0xACD70, 0xAEAB0, 0x1CEA38, 0x1CEA58, 0x038,
+        { 0x01050000, 0x6A442A2D, 0x1ED000, "1.5.0 RC", 0xACD70, 0xAEAB0, 0x1CEA38, 0x1CEA58, 0x038,
           0xAD8F0, 0xAE169, 0xDA600, 0x5D9DF, true },
+        // 1.5.0.0 final — Nexus "Prisma UI 1.5" (2026-09-12). SAME version word
+        // as the RC, different binary: every RVA moved (the RC row's CopyPixels
+        // call site landed on an F9 here and addon mode correctly aborted).
+        // sha256 DCFE5BBF…, pdb {1DF71091-2A56-470A-A9F4-738E2759F1A4} age 26.
+        // Seams re-verified against the PDB: the decorated names (which encode
+        // the full signatures) of CopyPixelsToTexture, DrawSingleTexture,
+        // Core::views, Core::viewsMutex and Core::screenSize are IDENTICAL to
+        // the RC's; viewsMutex still a bare SRWLOCK; PrismaView still
+        // originalUrl +0x38 / sizeof 760; the screen-size callee is still
+        // RE::BSGraphics::Renderer::GetScreenSize, reached through the same
+        // spill/reload into Core::screenSize (0x1D87C0); both prisma_laser_beam
+        // overlay keys still present. Call sites from
+        // tools/find_prisma_callsites.py (validated MATCH on 1.4.1 and the RC).
+        { 0x01050000, 0x6AA51726, 0x1FA000, "1.5.0", 0xACBB0, 0xAE8F0, 0x1D9C88, 0x1D9CA8, 0x038,
+          0xAD730, 0xADFA9, 0xE0550, 0x5D89F, true },
     };
 
     // ---- view resolution ------------------------------------------------
@@ -1006,12 +1026,30 @@ namespace {
         uint32_t ver = 0;
         std::memcpy(&ver, verData + 4, sizeof(ver));   // PluginVersionData::pluginVersion
 
+        // Exact build identity = version + PE TimeDateStamp + SizeOfImage, read
+        // from the loaded image's own headers. Version alone let 1.5.0 final
+        // pick the RC row (same version word); call-site validation caught it,
+        // but a build whose code happened to line up while its DATA moved
+        // (views/viewsMutex are not self-validating) would not have been caught.
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
+        const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            reinterpret_cast<const uint8_t*>(mod) + dos->e_lfanew);
+        const uint32_t tds = nt->FileHeader.TimeDateStamp;
+        const uint32_t soi = nt->OptionalHeader.SizeOfImage;
+
         const PrismaBuild* build = nullptr;
-        for (const auto& b : kPrismaBuilds) if (b.version == ver) { build = &b; break; }
+        bool versionKnown = false;
+        for (const auto& b : kPrismaBuilds) {
+            if (b.version != ver) continue;
+            versionKnown = true;
+            if (b.timeDateStamp == tds && b.sizeOfImage == soi) { build = &b; break; }
+        }
         if (!build) {
-            SKSE::log::error("addon mode: PrismaUI version {}.{}.{}.{} (raw {:#010x}) is NOT a known "
-                "build — installing NOTHING. Regenerate offsets with gen_offsets.py and add a row.",
-                (ver >> 24) & 0xFF, (ver >> 16) & 0xFF, (ver >> 4) & 0xFFF, ver & 0xF, ver);
+            SKSE::log::error("addon mode: PrismaUI version {}.{}.{}.{} (raw {:#010x}, TimeDateStamp {:#010x}, "
+                "SizeOfImage {:#x}) is NOT a known build{} — installing NOTHING. Regenerate offsets with "
+                "gen_offsets.py + find_prisma_callsites.py and add a row.",
+                (ver >> 24) & 0xFF, (ver >> 16) & 0xFF, (ver >> 4) & 0xFFF, ver & 0xF, ver, tds, soi,
+                versionKnown ? " (the version is known, but this is a DIFFERENT binary of it)" : "");
             return false;
         }
 

@@ -18,7 +18,7 @@ local commonlibvr = os.getenv("COMMONLIB_VR_DIR") or "D:/Games/My Skyrim/Tools/C
 includes(commonlibvr)
 
 set_project("PrismaUISteamVR")
-set_version("2.0.0")
+set_version("2.0.1")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")
